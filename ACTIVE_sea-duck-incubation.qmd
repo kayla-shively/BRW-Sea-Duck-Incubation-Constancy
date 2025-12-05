@@ -120,6 +120,8 @@ hen.act.filtered <- hen.act %>%
 **Table 1.** The number of monitored nests per species and year. The apparent nest success is calculated as the proportion of nests that hatched among those with known fates.
 
 ```{r}
+##### TO DO: WHERE ARE 2017/2018 NESTS HERE AND DOWNSTREAM?
+
 
 # Drop nests with undetermined fates for summary
 hen.act.filtered <- hen.act.filtered %>%
@@ -127,6 +129,7 @@ hen.act.filtered <- hen.act.filtered %>%
     "Undetermined - Nest is not viewable",
     "Undetermined - Active upon cam collect or battery died"
   ))
+
 
 # New column with just hatch/fail
 hen.act.filtered <- hen.act.filtered %>%
@@ -213,10 +216,13 @@ summary_wide %>%
     table.font.size   = px(12),
     data_row.padding  = px(2)
   )
-
 ```
 
 ```{r}
+##### TO DO: WHERE IS "UNKNOWN" PREDATOR.
+##### TO DO: INCLUDE DETAILS ON FOX CONTROL IN CAPTION.
+
+
 ### Summary of nest predators by years, all nests. 
 # Summarize number of nests by Year and Predator
 # Summarize by Year and Predator, excluding "NotApplicable"
@@ -256,6 +262,10 @@ ggplot(predator_summary, aes(x = factor(year), y = percent, fill = Fate_Dep_Spec
 **Figure 1.** Stacked bars show the percent contribution of identifiable predator species to nest failure from 2011 - 2025. Colors correspond to predator species detected via camera evidence or field sign, including Arctic Fox (ARFO), Raven (REFO), Glaucous Gull (GLGU), Jaeger species (JASP), Long-tailed Jaeger (LTJA), Parasitic Jaeger (PAJA), Polar Bear (POBE), Pomarine Jaeger (POJA), Snowy Owl (SNOW), and cases where the predator could not be determined (Unknown). Considerable interannual variation is evidence, with Arctic Fox consistently responsible for a large share of depredations in most years, while other species (e.g., gulls, jaegers, polar bears) contribute episodically.
 
 ```{r}
+##### TO DO: CHANGE FOR AVG RECESS LENGTH
+##### TO DO: ADDITIONAL TIME OF DAY RECESS FIGURE. 
+##### TO DO: ADDITIONAL TIME OF DAY RECESS WITH HOURLY TEMP FIGURE. 
+
 summary_table <- hen.act.filtered %>%
   filter(Behavior == "N-NotIncubating") %>%
   group_by(Species, RecessCause) %>%
@@ -303,6 +313,9 @@ ggplot(summary_table, aes(x = RecessCause, y = mean_DurationMins, fill = Species
 **Table 2.** Summary of sea duck nest monitoring effort by year and species at Point Barrow, Alaska. We show the number of monitored nests per species (after filtering), total minutes of incubation-related behavior recorded and mean number of minutes monitored per nest based on video footage classifications as either incubating or recess behavior.
 
 ```{r}
+##### TO DO: FIND AND FIX LENGTHY SPEI RECESSES. 
+
+
 # Verify fixed quirk with DurationMins, create days column
 hen.act.filtered <- hen.act.filtered %>%
   mutate(
@@ -360,7 +373,7 @@ nest_summary %>%
 **Note** **on nesting initiation**. Completeness varies among incubation initiation estimates (candling, hatch observations, etc), so I've made a tiered priority structure for estimating incubation start: inc_firsthatch; inc_hatch; inc_mean. If hatch is observed, we use inc_firsthatch, else inc_hatch. If candling/floating data are available, we use inc_mean. I created a new column that estimates this.
 
 ```{r}
-## Prepping dataframe
+# Prepping dataframe
 # Tiered incubation estimate strategy.
 hen.act.filtered <- hen.act.filtered %>%
   mutate(
@@ -554,6 +567,10 @@ species_constancy_table %>%
 **Wilcoxon Rank Sum test to compare incubation constancy by species and fate**
 
 ```{r}
+##### TO DO: CHECK LTDU AND OTHERS FOR FAILURES DURING LAYING. IF YES, INCLUDE WRITTEN DESCRIPTION 
+
+
+
 # Extract nest-level constancy plus fate
 nest_df <- nest_behavior_summary %>%
   filter(Fate_simple %in% c("Hatched", "Failed")) %>%
@@ -633,6 +650,10 @@ ggplot(nest_df,
 **Recess Behavior Summary**
 
 ```{r}
+##### TO DO: MAKE NORMAL TEXT BC LTDU IS CUT OFF. 
+
+
+
 ### Recess Frequency 
 
 # Filter for recesses
@@ -701,6 +722,10 @@ recess_summary %>%
 ```
 
 ```{r}
+##### TO DO: FIND MISSING ERROR BARS. 
+##### TO DO: MAKE SIMILAR FIGURES FOR DURATION OF RECESS AND NUMBER OF RECESSES. 
+##### TO DO: EXPERIMENT WITH SIMPLE REGRESSIONS ON THIS. 
+
 
 # create nest-level constancy
 hen_daily <- hen.act.filtered %>%
@@ -866,6 +891,11 @@ daily_wx_complete <- daily_wx_complete %>%
 **Body condition** is quantified as the residual of individual mass regressed on structural size measurements (wing chord and tarsus length) within species. Residual mass reflects whether a hen was heavier or lighter than expected for her size. To ensure comparability across predictors and facilitate model convergence, mass residuals were z-transformed for standardization. The number of sea duck measurements available per species are show below.
 
 ```{r}
+##### TO DO: PROVIDE MORE DETAILS ON THIS PROCESS
+##### TO DO: PROVIDE A COUNT OF NESTS WITH ALL VARIABLES IN GLMM.
+
+
+
 ## Data prep
 
 # Summary of how many capture duck measurements are available:
@@ -1075,6 +1105,10 @@ print(lrt_doy)
 ```
 
 ```{r effect-doy-species, fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+##### TO DO: DISPLAY THIS PLOT WITHOUT DAY OF YEAR TRANSFORMATION.
+
+
+
 # Build prediction grid: vary DOY, hold other predictors at mean
 doy_seq <- seq(
   min(constancy_data$z_DOY), 
@@ -1247,4 +1281,8 @@ kable(
 
     -   AWND: **p = 0.171**
 
-    -   **Interpretation:** Daily weather did not significantly influence time spent 
+    -   **Interpretation:** Daily weather did not significantly influence time spent
+
+TO DO:
+
+-   ADD FIGURE FOR TIME OF DAY BREAKS OCCUR. INCORPORTATE HOURLY WX.
