@@ -10,7 +10,12 @@
 
 # 3. If you want to use different files, edit the paths under `params:` at the top of the .qmd.
 
-# 4. Install required packages.
-install.packages(c("tidyverse","lubridate","kableExtra","gt","rstatix","coin","patchwork","gridExtra","lme4","glmmTMB","performance","purrr","broom","glue","car","cowplot","broom.mixed","DHARMa","FSA"))
+# 4. install required packages
+install.packages(c(
+  "tidyverse","lubridate","knitr","kableExtra","gt","xfun",
+  "rstatix","coin","patchwork","gridExtra","glmmTMB","performance",
+  "purrr","broom","glue","car","cowplot","broom.mixed","DHARMa","FSA",
+  "tidyr","gtable","scales","dplyr","tibble","ggh4x","lmerTest","MuMIn"
+))
 
 # 5. Click "Render" to generate the HTML report.
