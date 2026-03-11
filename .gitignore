@@ -19,3 +19,6 @@ _freeze/
 # OS
 .DS_Store
 Thumbs.db
+*_files/
+*.html
+data_raw/

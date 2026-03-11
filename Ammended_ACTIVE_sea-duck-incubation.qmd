@@ -1,0 +1,1296 @@
+---
+title: "Updated code from Chris's"
+author: "Kayla Shively"
+format: html
+editor: visual
+---
+
+```{r}
+# libraries
+
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(gt)
+library(purrr)
+library(tidyr)
+library(lme4)
+library(MuMIn)
+library(ggeffects)
+library(scales)
+library(tibble)
+
+# Set color palette
+palette <- c(
+  "KIEI" = "#4DBBD5FF",  
+  "LTDU" = "#3C5488FF",  
+  "SPEI" = "#00A087FF", 
+  "STEI" = "#E64B35FF"   
+)
+
+pal_common <- c(
+  "King Eider"         = unname(palette["KIEI"]),
+  "Long-tailed Duck"   = unname(palette["LTDU"]),
+  "Steller's Eider"    = unname(palette["STEI"]),
+  "Spectacled Eider"   = unname(palette["SPEI"]))
+
+# add common names
+species_labels <- c(
+  KIEI = "King Eider",
+  LTDU = "Long-tailed Duck",
+  STEI = "Steller's Eider",
+  SPEI = "Spectacled Eider"
+)
+
+```
+
+## Summaries
+
+```{r}
+### Create parsed datetimes and durations, keeping AK time zone
+hen_act_sql_time_dur <- hen_act_sql %>%
+  mutate(
+    begin_dt = with_tz(ymd_hms(datetime_begin_corrected, quiet = TRUE), tzone = "America/Anchorage"),
+    end_dt   = with_tz(ymd_hms(datetime_end_corrected, quiet = TRUE),   tzone = "America/Anchorage"),
+    duration_min = as.numeric(difftime(end_dt, begin_dt, units = "mins")),
+    duration_hr  = duration_min / 60
+  )
+
+### Plot incubation bout durations
+hen_act_sql_time_dur %>%
+  filter(behavior == "I-Incubating") %>%
+  ggplot(aes(duration_hr)) +
+  geom_histogram(bins = 100) +
+  coord_cartesian(xlim = c(0, 150)) +
+  labs(
+    x = "Incubation bout length (hours)",
+    y = "Frequency",
+    title = "Distribution of incubation bout durations"
+  ) +
+  theme_minimal()
+
+### Check for absurb values
+hen_act_sql_time_dur %>%
+  filter(behavior == "I-Incubating") %>%
+  summarise(
+    min_hr = min(duration_hr, na.rm = TRUE),
+    mean_hr = mean(duration_hr, na.rm = TRUE),
+    max_hr = max(duration_hr, na.rm = TRUE),
+    n_over_24 = sum(duration_hr > 24, na.rm = TRUE)
+  )
+
+behaviors_over_24hr <- hen_act_sql_time_dur %>%
+  filter(behavior == "I-Incubating",
+    !is.na(duration_hr),
+    duration_hr > 24
+  ) %>%
+  arrange(desc(duration_hr))
+```
+
+```{r}
+### Identify nests with <1440 minutes of observation
+View(hen_act_sql_time_dur)
+
+hen_act_sql_time_dur_total <- hen_act_sql_time_dur %>%
+  group_by(nest_id) %>%
+  mutate(
+    total_mins = sum(
+      duration_min[behavior %in% c("N-NotIncubating", "I-Incubating")],
+      na.rm = TRUE
+    )
+  ) %>%
+  ungroup()
+
+## Identify valid nests (>= 24 hours of observation)
+valid_nests <- hen_act_sql_time_dur_total %>%
+  filter(total_mins >= 1440) %>%
+  distinct(nest_id) %>%
+  pull(nest_id)
+
+## New working dataset without low-observation nests
+hen_act_sql_time_dur_total_valid <- hen_act_sql_time_dur_total %>%
+  filter(nest_id %in% valid_nests)
+
+View(hen_act_sql_time_dur_total_valid)
+```
+
+Filtering
+
+-   `` `r length(unique(hen_act_sql_time_dur_total_valid$nest_id)) - length(unique(hen_act_sql_time_dur_total$nest_id))` `` nests were removed from the dataset because they had \<1 day (1440 minutes) of incubation behavior (failed shortly after deployment).
+
+**Table 1.** Number of sea duck nests monitored with time-lapse cameras from 2011-2025, after filtering nests with less than 1 day of incubation monitoring. Apparent nest success is calculated as the proportion of nests that hatched among those with known fates. Years without data reflect periods of experimental nest covers or suspended field operations (2017, 2018, 2020, and 2021).
+
+```{r}
+### Add species and year into activities for summary
+hen_nests_joined <- hen_act_sql_time_dur_total_valid %>%
+  inner_join(nests_master_clean, by = "nest_id")
+
+## Check number of nests retained
+hen_nests_joined %>%
+  summarise(n_nests = n_distinct(nest_id))
+
+## Check if any init values are missing
+hen_nests_joined %>%
+  summarise(missing_init_median = sum(is.na(init_median)))
+
+
+# Create one record per nest
+nest_level <- hen_nests_joined %>%
+  group_by(species, year, nest_id) %>%
+  summarise(
+    fate_simple = case_when(
+      any(fate == "Hatched", na.rm = TRUE) ~ "Hatched",
+      any(fate == "Destroyed", na.rm = TRUE) ~ "Destroyed",
+      TRUE ~ NA_character_
+    ),
+    .groups = "drop"
+  )
+
+# Count nests per species per year
+nests_per_year <- nest_level %>%
+  count(species, year, name = "n_nests")
+
+# Calculate apparent nest success
+apparent_success <- nest_level %>%
+  filter(!is.na(fate_simple)) %>%
+  group_by(species) %>%
+  summarise(
+    apparent_success = mean(fate_simple == "Hatched"),
+    apparent_success_pct = round(100 * apparent_success, 1),
+    .groups = "drop"
+  )
+
+# Convert to wide format
+nests_wide <- nests_per_year %>%
+  pivot_wider(
+    names_from = year,
+    values_from = n_nests,
+    values_fill = 0
+  )
+
+# Order year columns numerically
+year_cols <- nests_wide %>%
+  select(-species) %>%
+  names() %>%
+  as.integer() %>%
+  sort() %>%
+  as.character()
+
+nests_wide_ordered <- nests_wide %>%
+  select(species, all_of(year_cols))
+
+# Combine tables
+summary_wide <- nests_wide_ordered %>%
+  left_join(apparent_success, by = "species") %>%
+  mutate(
+    Total = rowSums(across(all_of(year_cols)), na.rm = TRUE)
+  ) %>%
+  relocate(Total, .after = all_of(tail(year_cols, 1))) %>%
+  arrange(species)
+
+# Convert species codes to common names
+nest_summary <- summary_wide %>%
+  mutate(
+    species = dplyr::recode(
+      as.character(species),
+      KIEI = "King Eider",
+      LTDU = "Long-tailed Duck",
+      STEI = "Steller's Eider",
+      SPEI = "Spectacled Eider"
+    )
+  ) %>%
+  select(species, all_of(year_cols), Total, apparent_success_pct) %>%
+  rename(
+    Species = species,
+    `Apparent Nest Success (%)` = apparent_success_pct
+  ) %>%
+  gt() %>%
+  cols_align(
+    align = "center",
+    columns = everything()
+  ) %>%
+  tab_options(
+    table.font.size = px(12),
+    data_row.padding = px(2)
+  )
+
+nest_summary
+
+# Save table
+gtsave(
+  nest_summary,
+  filename = "table_nest_summary_by_species_year.png",
+  vwidth = 900,
+  vheight = 300
+)
+View(hen_nests_joined)
+```
+
+\
+**Table 2.** Coverage of time-lapse video monitoring of incubation behavior in Arctic-breeding sea duck nests near Utqiagvik, Alaska, USA between 2011-2025.
+
+```{r}
+# If needed, first create duration_days from duration_hr
+hen_nests_joined <- hen_nests_joined %>%
+  mutate(duration_days = duration_min / 1440)
+
+# Summarize days per nest of I and N behaviors
+nest_days <- hen_nests_joined %>%
+  filter(behavior %in% c("I-Incubating", "N-NotIncubating")) %>%
+  group_by(species, nest_id) %>%
+  summarise(
+    days_per_nest = sum(duration_days, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Summarize by species and add SD
+nest_summary <- nest_days %>%
+  group_by(species) %>%
+  summarise(
+    Number_of_Nests = n(),
+    Total_Days_Monitored = sum(days_per_nest, na.rm = TRUE),
+    Mean_Days = mean(days_per_nest, na.rm = TRUE),
+    SD_Days = sd(days_per_nest, na.rm = TRUE),
+    Mean_SD = paste0(
+      round(Mean_Days, 1), " ± ", round(SD_Days, 1)
+    ),
+    .groups = "drop"
+  )
+
+# Create table with mean ± SD instead of separate columns
+nest_coverage <- nest_summary %>%
+  mutate(
+    species = dplyr::recode(
+      as.character(species),
+      KIEI = "King Eider",
+      LTDU = "Long-tailed Duck",
+      STEI = "Steller's Eider",
+      SPEI = "Spectacled Eider"
+    )
+  ) %>%
+  rename(Species = species) %>%
+  select(
+    Species,
+    `N (nests)` = Number_of_Nests,
+    `Days Monitored` = Total_Days_Monitored,
+    `Mean (± SD)` = Mean_SD
+  ) %>%
+  gt() %>%
+  cols_align(align = "center", columns = everything()) %>%
+  fmt_number(columns = c(`N (nests)`, `Days Monitored`), decimals = 0) %>%
+  tab_options(
+    table.font.size = px(12),
+    data_row.padding = px(2)
+  )
+
+nest_coverage
+
+gtsave(
+  nest_coverage,
+  filename = "table_nest_coverage.png",
+  vwidth = 900,
+  vheight = 300
+)
+```
+
+```{r}
+# Calculate days since initiation
+hen_nests_joined <- hen_nests_joined %>%
+  mutate(
+    begin_dt = if ("begin_dt" %in% names(.)) begin_dt else ymd_hms(datetime_begin_corrected, quiet = TRUE),
+    doy = yday(begin_dt),
+    day_since_init = doy - init_median,
+    day_since_init_int = floor(day_since_init)
+  )
+
+# Build dataset for nests monitored per day since initiation
+monitoring_dist <- hen_nests_joined %>%
+  filter(
+    behavior %in% c("I-Incubating", "N-NotIncubating"),
+    !is.na(day_since_init_int),
+    !is.na(species),
+    !is.na(nest_id)
+  ) %>%
+  distinct(species, nest_id, day_since_init_int) %>%   # one record per nest per day
+  count(species, day_since_init_int, name = "n_nests")
+
+# Clean species labels for plotting
+plot_dat <- monitoring_dist %>%
+  mutate(
+    species = trimws(as.character(species)),
+    Species = case_when(
+      species == "KIEI" ~ "King Eider",
+      species == "LTDU" ~ "Long-tailed Duck",
+      species == "STEI" ~ "Steller's Eider",
+      species == "SPEI" ~ "Spectacled Eider",
+      TRUE ~ NA_character_
+    ),
+    Species = factor(
+      Species,
+      levels = c("King Eider", "Long-tailed Duck", "Steller's Eider", "Spectacled Eider")
+    )
+  ) %>%
+  filter(!is.na(Species))
+
+nest_coverage <- ggplot(plot_dat, aes(x = day_since_init_int, y = n_nests, fill = Species)) +
+  geom_col() +
+  facet_wrap(~ Species, ncol = 2, scales = "free_y") +
+  scale_fill_manual(
+    values = c(
+      "King Eider"       = unname(palette["KIEI"]),
+      "Long-tailed Duck" = unname(palette["LTDU"]),
+      "Steller's Eider"  = unname(palette["STEI"]),
+      "Spectacled Eider" = unname(palette["SPEI"])
+    ),
+    drop = FALSE
+  ) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) +
+  labs(
+    x = "Days since nest initiation",
+    y = "Number of nests monitored",
+    fill = "Species"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+nest_coverage
+
+ggsave(
+  "nest_coverage.png",
+  plot = nest_coverage,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+```
+
+**Figure 3.** Distribution of monitoring duration across the incubation period for four Arctic-breeding sea ducks near Utqiaġvik, Alaska between 2011-2025. Histograms show the number of nests monitored by day since nest initiation for *S. spectabilis*, *C. hyemalis*, *P. stelleri,* and *S. fischeri*, illustrating camera monitoring coverage and temporal distribution during incubation.
+
+**Table 3.** Mean values of incubation constancy of Hatched nests with 95% confidence intervals for Arctic-breeding sea duck nests near Utqiagvik, Alaska, USA between 2011-2025. Event-weighted, not nest-weighted.
+
+```{r}
+####### You may need to address unviewable nest days prior to these analyses. 
+
+### Calculate constancy
+constancy_events <- hen_nests_joined %>%
+  filter(
+    fate == "Hatched",
+    behavior %in% c("I-Incubating", "N-NotIncubating"),
+    !is.na(duration_min),
+    duration_min >= 0
+  ) %>%
+  mutate(
+    incubating_time = if_else(behavior == "I-Incubating", duration_min, 0),
+    recess_time     = if_else(behavior == "N-NotIncubating", duration_min, 0)
+  )
+
+constancy_summary <- constancy_events %>%
+  group_by(species) %>%
+  summarise(
+    incubating_minutes = sum(incubating_time, na.rm = TRUE),
+    recess_minutes     = sum(recess_time, na.rm = TRUE),
+    total_minutes      = incubating_minutes + recess_minutes,
+    
+    mean_constancy = incubating_minutes / total_minutes,
+    
+    se_constancy = sqrt(mean_constancy * (1 - mean_constancy) / total_minutes),
+    
+    CI_lower = mean_constancy - 1.96 * se_constancy,
+    CI_upper = mean_constancy + 1.96 * se_constancy,
+    
+    .groups = "drop"
+  )
+
+constancy_summary <- constancy_summary %>%
+  mutate(
+    Species = dplyr::recode(
+      as.character(species),
+      KIEI = "King Eider",
+      LTDU = "Long-tailed Duck",
+      STEI = "Steller's Eider",
+      SPEI = "Spectacled Eider"
+    )
+  )
+
+constancy_table <- constancy_summary %>%
+  select(
+    Species,
+    `Mean constancy` = mean_constancy,
+    `Lower 95% CI` = CI_lower,
+    `Upper 95% CI` = CI_upper
+  ) %>%
+  gt() %>%
+  cols_align(
+    align = "center",
+    columns = everything()
+  ) %>%
+  fmt_number(
+    columns = c(`Mean constancy`, `Lower 95% CI`, `Upper 95% CI`),
+    decimals = 3
+  ) %>%
+  tab_options(
+    table.font.size = px(12),
+    data_row.padding = px(2)
+  )
+
+constancy_table
+
+gtsave(
+  constancy_table,
+  filename = "constancy_table.png",
+  vwidth = 900,
+  vheight = 300
+)
+```
+
+```{r}
+### Comparing Hatched and Destroyed Nests
+# Nest-level incubation constancy
+nest_behavior_summary <- hen_nests_joined %>%
+  filter(
+    behavior %in% c("I-Incubating", "N-NotIncubating"),
+    fate %in% c("Hatched", "Destroyed"),
+    !is.na(duration_min),
+    duration_min >= 0
+  ) %>%
+  group_by(species, nest_id, fate, behavior) %>%
+  summarise(
+    total_minutes = sum(duration_min, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = behavior,
+    values_from = total_minutes,
+    values_fill = 0
+  ) %>%
+  mutate(
+    total_monitored = `I-Incubating` + `N-NotIncubating`,
+    constancy = if_else(
+      total_monitored > 0,
+      `I-Incubating` / total_monitored,
+      NA_real_
+    )
+  ) %>%
+  filter(!is.na(constancy))
+
+# Extract nest-level constancy plus fate
+nest_df <- nest_behavior_summary %>%
+  select(species, nest_id, fate, constancy)
+
+# Prep plot dataframe
+df <- nest_df %>%
+  mutate(
+    Species = dplyr::recode(
+      as.character(species),
+      KIEI = "King Eider",
+      LTDU = "Long-tailed Duck",
+      STEI = "Steller's Eider",
+      SPEI = "Spectacled Eider"
+    ),
+    Species = factor(
+      Species,
+      levels = c("King Eider", "Long-tailed Duck", "Steller's Eider", "Spectacled Eider")
+    ),
+    Fate_simple = factor(fate, levels = c("Destroyed", "Hatched"))
+  ) %>%
+  filter(!is.na(constancy), !is.na(Species), !is.na(Fate_simple))
+
+# Group summaries (mean ± 95% CI)
+sum_sf <- df %>%
+  group_by(Species, Fate_simple) %>%
+  summarise(
+    n = n(),
+    mean = mean(constancy, na.rm = TRUE),
+    sd = sd(constancy, na.rm = TRUE),
+    se = sd / sqrt(n),
+    tcrit = qt(0.975, df = pmax(n - 1, 1)),
+    lo = mean - tcrit * se,
+    hi = mean + tcrit * se,
+    .groups = "drop"
+  )
+
+# Wilcoxon within species and labels
+p_lab <- df %>%
+  group_by(Species) %>%
+  summarise(
+    p_value = if_else(
+      all(c("Destroyed", "Hatched") %in% Fate_simple) &
+        sum(Fate_simple == "Destroyed") > 0 &
+        sum(Fate_simple == "Hatched") > 0,
+      wilcox.test(constancy ~ Fate_simple, exact = FALSE)$p.value,
+      NA_real_
+    ),
+    y_pos = max(constancy, na.rm = TRUE) + 0.05 * diff(range(constancy, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    label = case_when(
+      is.na(p_value)  ~ "p = NA",
+      p_value < 0.001 ~ "p < 0.001",
+      TRUE ~ paste0("p = ", signif(p_value, 2))
+    )
+  ) %>%
+  mutate(y_pos = pmin(y_pos, 0.98))
+
+# Set palette
+pal_common <- c(
+  "King Eider" = unname(palette["KIEI"]),
+  "Long-tailed Duck" = unname(palette["LTDU"]),
+  "Steller's Eider" = unname(palette["STEI"]),
+  "Spectacled Eider" = unname(palette["SPEI"])
+)
+
+# Plot figure
+Fig3 <- ggplot(df, aes(x = Fate_simple, y = constancy, color = Species)) +
+  geom_errorbar(
+    data = sum_sf,
+    aes(x = Fate_simple, ymin = lo, ymax = hi, color = Species),
+    width = 0.18,
+    linewidth = 1.1,
+    inherit.aes = FALSE
+  ) +
+  geom_point(
+    position = position_jitter(width = 0.08, height = 0),
+    alpha = 0.6,
+    size = 2
+  ) +
+  geom_text(
+    data = p_lab,
+    aes(x = 1.5, y = y_pos, label = label),
+    inherit.aes = FALSE,
+    size = 4,
+    color = "grey20"
+  ) +
+  facet_wrap(~ Species, ncol = 2) +
+  scale_color_manual(values = pal_common, guide = "none") +
+  coord_cartesian(ylim = c(0.60, 1.00)) +
+  labs(
+    x = "Nest fate",
+    y = "Incubation constancy"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+Fig3
+
+# Export as PNG
+ggsave(
+  "Fig3.png",
+  plot = Fig3,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+```
+
+**Figure 3.** Mean daily incubation constancy by nest fate for four Arctic-breeding sea ducks near Utqiaġvik, Alaska between 2011-2025. Points represent nest-level mean incubation constancy (excluding the terminal day), with larger points and error bars indicating species-specific means ± SD for failed and hatched nests. P-values denote results of species-specific comparisons between nest fate categories.
+
+```{r}
+core_frac <- 0.50  # dominant window contains this fraction of recesses
+
+# one row per recess with hour of day (common names)
+recess_tod <- hen_nests_joined %>%
+  filter(behavior %in% c("N-NotIncubating", "not_incubating")) %>%
+  mutate(
+    begin_dt = if ("begin_dt" %in% names(.)) {
+      begin_dt
+    } else {
+      ymd_hms(datetime_begin_corrected, quiet = TRUE)
+    },
+    hour = lubridate::hour(begin_dt),
+    Species = dplyr::recode(
+      as.character(species),
+      KIEI = "King Eider",
+      LTDU = "Long-tailed Duck",
+      STEI = "Steller's Eider",
+      SPEI = "Spectacled Eider"
+    ),
+    Species = factor(
+      Species,
+      levels = c("King Eider", "Long-tailed Duck", "Steller's Eider", "Spectacled Eider")
+    )
+  ) %>%
+  filter(!is.na(hour), !is.na(Species)) %>%
+  distinct(nest_id, Species, activity_id, hour)   # one row per recess event
+
+# counts by hour
+hour_counts <- recess_tod %>%
+  count(Species, hour, name = "n_recesses") %>%
+  complete(Species, hour = 0:23, fill = list(n_recesses = 0L))
+
+Fig4_count <- ggplot(hour_counts, aes(x = hour, y = n_recesses, fill = Species)) +
+  geom_col(show.legend = FALSE, width = 0.85) +
+  facet_wrap(~ Species, ncol = 2, scales = "free_y") +
+  scale_fill_manual(values = pal_common, drop = FALSE) +
+  scale_x_continuous(breaks = seq(0, 23, 3), minor_breaks = NULL) +
+  labs(
+    x = "Hour of day (recess start time)",
+    y = "Number of recesses",
+    title = "Starting hour of recesses (counts)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+Fig4_count
+
+# proportion by hour within species
+hour_summ <- hour_counts %>%
+  group_by(Species) %>%
+  mutate(prop_recesses = n_recesses / sum(n_recesses, na.rm = TRUE)) %>%
+  ungroup()
+
+# helper: find smallest contiguous circular window containing core_frac of recesses
+find_core_window <- function(hour, prop, frac = 0.5) {
+  full <- tibble(hour = 0:23) %>%
+    left_join(tibble(hour = hour, prop = prop), by = "hour") %>%
+    mutate(prop = tidyr::replace_na(prop, 0)) %>%
+    arrange(hour)
+
+  # duplicate for circular wrap
+  h2 <- c(full$hour, full$hour + 24)
+  p2 <- c(full$prop, full$prop)
+
+  best_len <- Inf
+  best_i <- best_j <- NA
+  i <- 1
+  s <- 0
+
+  for (j in seq_along(p2)) {
+    s <- s + p2[j]
+    while (s - p2[i] >= frac) {
+      s <- s - p2[i]
+      i <- i + 1
+    }
+    if (s >= frac && h2[i] < 24 && h2[j] <= h2[i] + 24) {
+      len <- h2[j] - h2[i]
+      if (len < best_len) {
+        best_len <- len
+        best_i <- i
+        best_j <- j
+      }
+    }
+  }
+
+  xmin <- h2[best_i]
+  xmax <- h2[best_j] + 1
+
+  if (xmax <= 24) {
+    tibble(xmin = xmin, xmax = xmax)
+  } else {
+    bind_rows(
+      tibble(xmin = xmin, xmax = 24),
+      tibble(xmin = 0, xmax = xmax - 24)
+    )
+  }
+}
+
+# build per-species shading rectangles
+shade_df <- hour_summ %>%
+  group_by(Species) %>%
+  summarise(
+    rects = list(find_core_window(hour, prop_recesses, frac = core_frac)),
+    .groups = "drop"
+  ) %>%
+  unnest(rects) %>%
+  mutate(ymin = -Inf, ymax = Inf)
+
+# sample sizes
+n_recess_labels <- hour_counts %>%
+  group_by(Species) %>%
+  summarise(
+    n_recess = sum(n_recesses),
+    .groups = "drop"
+  ) %>%
+  mutate(label = paste0("n = ", n_recess))
+
+# proportions + dominant window shading
+Fig4 <- ggplot(hour_summ, aes(x = hour, y = prop_recesses, fill = Species)) +
+  geom_rect(
+    data = shade_df,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    inherit.aes = FALSE,
+    fill = "grey30",
+    alpha = 0.12
+  ) +
+  geom_col(show.legend = FALSE, width = 0.85) +
+  facet_wrap(~ Species, ncol = 2) +
+  scale_fill_manual(values = pal_common, drop = FALSE) +
+  scale_x_continuous(breaks = seq(0, 23, 3), minor_breaks = NULL) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    x = "Hour of day (recess start time)",
+    y = "Proportion of recesses"
+  ) +
+  geom_text(
+    data = n_recess_labels,
+    aes(x = 23.5, y = 0.125, label = label),
+    inherit.aes = FALSE,
+    hjust = 1,
+    vjust = 1,
+    size = 4
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(linewidth = 0.4),
+    strip.text = element_text(face = "bold")
+  )
+
+Fig4
+
+ggsave(
+  "Fig4.png",
+  plot = Fig4,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+```
+
+**Figure 4.** Distribution of incubation recess start times across the diel cycle for four Arctic-breeding sea ducks nears Utqiaġvik, Alaska between 2011-2025. Bars show the proportion of observed recesses initiating in each hour of the day. Sample sizes (n) indicate the total number of recess per species. Shaded regions denote the smallest contiguous time interval containing 50% of recess starts.
+
+Daily Incubation Constancy analysis
+
+```{r}
+# Logit-normal mixed models for daily incubation constancy
+# Response: proportional daily incubation constancy (0–1)
+# Model:    lmer() on logit-transformed proportion (logit-normal)
+# Random:   nest_id and year, if supported by variance estimates
+
+# read in weather
+met_raw <- barrow_ghcnd_daily <- read_csv(
+  "C:/Users/Kayla Shively/Desktop/barrow_incubation_analysis/barrow_ghcnd_daily.csv"
+)
+
+# data prep: build one row per nest-day
+daily_ducks <- hen_nests_joined %>%
+  filter(behavior %in% c("I-Incubating", "N-NotIncubating")) %>%
+  mutate(
+    begin_dt = if ("begin_dt" %in% names(.)) begin_dt else ymd_hms(datetime_begin_corrected, quiet = TRUE),
+    date = as.Date(begin_dt)
+  ) %>%
+  group_by(species, nest_id, date) %>%
+  summarise(
+    mins_inc = sum(duration_min[behavior == "I-Incubating"], na.rm = TRUE),
+    mins_non = sum(duration_min[behavior == "N-NotIncubating"], na.rm = TRUE),
+    mins_tot = mins_inc + mins_non,
+    constancy_daily = if_else(mins_tot > 0, mins_inc / mins_tot, NA_real_),
+    recesses_daily = sum(behavior == "N-NotIncubating", na.rm = TRUE),
+    day_since_init = mean(day_since_init, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# add in daily weather variables (TMAX + wind)
+# drop TMIN due to correlation with TMAX
+met_daily <- met_raw %>%
+  mutate(
+    date = as.Date(DATE),
+    TMAX_C = ifelse(is.na(TMAX), NA_real_, TMAX / 10),
+    AWND_ms = ifelse(is.na(AWND), NA_real_, AWND / 10)
+  ) %>%
+  select(date, TMAX_C, AWND_ms) %>%
+  arrange(date)
+
+daily_wx <- daily_ducks %>%
+  left_join(met_daily, by = "date") %>%
+  mutate(
+    date = ymd(date),
+    DOY = yday(date),
+    Year = factor(year(date)),
+    Species = factor(species),
+    Nest_ID = factor(nest_id)
+  )
+
+# standardize analysis dataset and add boundary adjustment for 0/1 values
+constancy_camera <- daily_wx %>%
+  filter(
+    !is.na(constancy_daily),
+    !is.na(DOY),
+    !is.na(Year),
+    !is.na(TMAX_C),
+    !is.na(AWND_ms),
+    is.finite(day_since_init),
+    mins_tot > 0
+  ) %>%
+  mutate(
+    z_DOY = as.numeric(scale(DOY)),
+    z_TMAX = as.numeric(scale(TMAX_C)),
+    z_AWND = as.numeric(scale(AWND_ms)),
+    z_stage = as.numeric(scale(day_since_init)),
+    eps = 0.001,
+    constancy_adj = pmin(pmax(constancy_daily, eps), 1 - eps),
+    logit_const = qlogis(constancy_adj)
+  )
+
+# model fitting
+ctrl <- lmerControl(
+  optimizer = "bobyqa",
+  optCtrl = list(maxfun = 2e5)
+)
+
+# if Year goes singular, switch to "(1 | Nest_ID)" only
+re_form <- "(1 | Nest_ID) + (1 | Year)"
+
+m_cam_null <- lmer(
+  as.formula(paste("logit_const ~ 1 +", re_form)),
+  data = constancy_camera,
+  control = ctrl,
+  REML = FALSE
+)
+
+m_cam_stage <- lmer(
+  as.formula(paste("logit_const ~ z_stage + Species +", re_form)),
+  data = constancy_camera,
+  control = ctrl,
+  REML = FALSE
+)
+
+m_cam_doy <- lmer(
+  as.formula(paste("logit_const ~ z_DOY + z_stage + Species +", re_form)),
+  data = constancy_camera,
+  control = ctrl,
+  REML = FALSE
+)
+
+m_cam_TMAX <- lmer(
+  as.formula(paste("logit_const ~ z_stage + z_TMAX + Species +", re_form)),
+  data = constancy_camera,
+  control = ctrl,
+  REML = FALSE
+)
+
+m_cam_AWND <- lmer(
+  as.formula(paste("logit_const ~ z_stage + z_AWND + Species +", re_form)),
+  data = constancy_camera,
+  control = ctrl,
+  REML = FALSE
+)
+
+m_cam_TMAX_AWND <- lmer(
+  as.formula(paste("logit_const ~ z_stage + z_TMAX + z_AWND + Species +", re_form)),
+  data = constancy_camera,
+  control = ctrl,
+  REML = FALSE
+)
+
+m_cam_doy_TMAX <- lmer(
+  as.formula(paste("logit_const ~ z_DOY + z_stage + z_TMAX + Species +", re_form)),
+  data = constancy_camera,
+  control = ctrl,
+  REML = FALSE
+)
+
+m_cam_doy_AWND <- lmer(
+  as.formula(paste("logit_const ~ z_DOY + z_stage + z_AWND + Species +", re_form)),
+  data = constancy_camera,
+  control = ctrl,
+  REML = FALSE
+)
+
+m_cam_doy_TMAX_AWND <- lmer(
+  as.formula(paste("logit_const ~ z_DOY + z_stage + z_TMAX + z_AWND + Species +", re_form)),
+  data = constancy_camera,
+  control = ctrl,
+  REML = FALSE
+)
+
+m_cam_int_doy <- lmer(
+  as.formula(paste("logit_const ~ z_DOY * Species + z_stage + z_TMAX + z_AWND +", re_form)),
+  data = constancy_camera,
+  control = ctrl,
+  REML = FALSE
+)
+
+# make AICc table
+cam_set <- list(
+  null = m_cam_null,
+  stage = m_cam_stage,
+  doy = m_cam_doy,
+  TMAX = m_cam_TMAX,
+  wind = m_cam_AWND,
+  TMAX_wind = m_cam_TMAX_AWND,
+  doy_TMAX = m_cam_doy_TMAX,
+  doy_wind = m_cam_doy_AWND,
+  doy_TMAX_wind = m_cam_doy_TMAX_AWND,
+  int_doy_TMAX_wind = m_cam_int_doy
+)
+
+model_labels <- c(
+  null = "Intercept (random Nest + Year)",
+  stage = "Stage",
+  doy = "DOY + stage",
+  TMAX = "Stage + TMAX",
+  wind = "Stage + wind",
+  TMAX_wind = "Stage + TMAX + wind",
+  doy_TMAX = "DOY + stage + TMAX",
+  doy_wind = "DOY + stage + wind",
+  doy_TMAX_wind = "DOY + stage + TMAX + wind",
+  int_doy_TMAX_wind = "DOY × Species + stage + TMAX + wind"
+)
+
+get_nobs <- function(m) nobs(m)
+
+aicc_cam_tbl <- purrr::imap_dfr(cam_set, \(m, nm) {
+  ll <- logLik(m)
+  tibble(
+    Model_key = nm,
+    n = get_nobs(m),
+    K = attr(ll, "df"),
+    logLik = as.numeric(ll),
+    AIC = AIC(m),
+    AICc = MuMIn::AICc(m)
+  )
+}) %>%
+  mutate(Model = dplyr::recode(Model_key, !!!model_labels)) %>%
+  arrange(AICc) %>%
+  mutate(
+    `ΔAICc` = AICc - min(AICc, na.rm = TRUE),
+    Weight = exp(-0.5 * `ΔAICc`) / sum(exp(-0.5 * `ΔAICc`), na.rm = TRUE),
+    Weight = round(Weight, 3)
+  )
+
+best_key <- aicc_cam_tbl$Model_key[1]
+m_best <- cam_set[[best_key]]
+
+# publication-quality table
+Table4 <- aicc_cam_tbl %>%
+  select(Model, K, logLik, AICc, `ΔAICc`, Weight) %>%
+  gt() %>%
+  cols_align(align = "center", columns = c(K, logLik, AICc, `ΔAICc`, Weight)) %>%
+  cols_align(align = "left", columns = Model) %>%
+  fmt_number(columns = "K", decimals = 0) %>%
+  fmt_number(columns = c("logLik", "AICc", `ΔAICc`), decimals = 2) %>%
+  fmt_number(columns = "Weight", decimals = 3) %>%
+  cols_label(
+    Model = "Model",
+    K = "K",
+    logLik = html("logLik"),
+    AICc = html("AIC<sub>c</sub>"),
+    `ΔAICc` = html("&Delta;AIC<sub>c</sub>"),
+    Weight = html("w<sub>i</sub>")
+  ) %>%
+  tab_options(
+    table.font.size = px(12),
+    data_row.padding = px(2)
+  )
+
+Table4
+
+gtsave(
+  Table4,
+  filename = "Table4.png",
+  vwidth = 900,
+  vheight = 300
+)
+```
+
+Results :
+
+-   Incubation likely changes across incubation stage, which is biologically expected.
+
+-   DOY x Species interaction
+
+    -   Earlier breeders experience colder temperatures
+
+    -   different species respond differently to weather
+
+    -   timing of snowmelt and food availability differs
+
+-   Weather (TMAX + wind). Aligns with known energetics in KIEI and SPEI.
+
+    -   colder conditions –\> hens may recess less
+
+    -   high wind –\> may increase energetic cost of incubation
+
+Am I overparameterizing? Probably not? AICc penalizes model complexity. My best model has K = 14 parameters, but AICc already penalizes extra parameters. Despite that penalty, the model still wins by \~10 AICc units, which is strong evidence that the added terms improve fit.
+
+```{r}
+### MOdel checks
+
+# Is the Year random effect singular? 
+isSingular(m_best) # Looking for FALSE
+
+# Look at effect sizes
+summary(m_best)
+
+# Check outlier
+which.min(residuals(m_best))
+
+isSingular(m_best) # Looking for FALSE
+```
+
+Looking at effect sizes:
+
+-   z_DOY:SpeciesLTDU = +0.86
+
+-   z_DOY:SpeciesSTEI = +0.71
+
+-   z_DOY:SpeciesSPEI ≈ 0
+
+KIEI constantly declines through the season, LTDU and STEI have less seasonal declines (possibly stable or increasing), Spectacled has little seasonal change.
+
+-   z_stage = −0.24\
+    t ≈ −2.1
+
+Constancy slightly decreases as incubation progresses. Explanations: hens take slightly longer recesses later in incubation, energy depletion, increased embryo thermoregulation near hatch.
+
+Manuscript interpretation: Daily incubation constancy varied among species and across the breeding season. King Eiders exhibited the highest constancy overall, whereas Long-tailed Ducks and Steller's Eiders showed substantially lower constancy. Seasonal patterns differed among species, with constancy declining through the season in King Eiders but remaining relatively stable in other species. Incubation constancy also declined slightly with incubation stage, while daily temperature and wind speed had little effect.
+
+```{r}
+### Visualization
+# inverse-logit helper
+inv_logit <- function(x) plogis(x)
+
+# sequence across observed DOY range
+doy_seq <- seq(
+  min(constancy_camera$DOY, na.rm = TRUE),
+  max(constancy_camera$DOY, na.rm = TRUE),
+  length.out = 200
+)
+
+# prediction grid
+pred_grid <- expand.grid(
+  DOY = doy_seq,
+  Species = levels(constancy_camera$Species)
+) %>%
+  as_tibble() %>%
+  mutate(
+    # recreate z_DOY using the same centering/scaling as the analysis data
+    z_DOY = (DOY - mean(constancy_camera$DOY, na.rm = TRUE)) /
+      sd(constancy_camera$DOY, na.rm = TRUE),
+
+    # hold other covariates at mean standardized values
+    z_stage = 0,
+    z_TMAX  = 0,
+    z_AWND  = 0
+  )
+
+# build design matrix for fixed effects only
+X <- model.matrix(
+  ~ z_DOY * Species + z_stage + z_TMAX + z_AWND,
+  data = pred_grid
+)
+
+b <- lme4::fixef(m_best)
+V <- as.matrix(vcov(m_best))
+
+# align columns with fixed effects
+X <- X[, names(b), drop = FALSE]
+
+# predictions and Wald SE on link scale
+fit_link <- as.vector(X %*% b)
+se_link  <- sqrt(pmax(0, diag(X %*% V %*% t(X))))
+
+pred_grid <- pred_grid %>%
+  mutate(
+    fit_link = fit_link,
+    se_link  = se_link,
+    lo_link  = fit_link - 1.96 * se_link,
+    hi_link  = fit_link + 1.96 * se_link,
+    fit = inv_logit(fit_link),
+    lo  = inv_logit(lo_link),
+    hi  = inv_logit(hi_link)
+  )
+
+# relabel species with common names
+pred_plot <- pred_grid %>%
+  mutate(
+    Species = recode_factor(
+      Species,
+      KIEI = "King Eider",
+      LTDU = "Long-tailed Duck",
+      SPEI = "Spectacled Eider",
+      STEI = "Steller's Eider"
+    )
+  )
+
+# raw data for x-axis rugs
+raw_plot <- constancy_camera %>%
+  filter(!is.na(DOY), !is.na(Species)) %>%
+  mutate(
+    Species = recode_factor(
+      Species,
+      KIEI = "King Eider",
+      LTDU = "Long-tailed Duck",
+      SPEI = "Spectacled Eider",
+      STEI = "Steller's Eider"
+    )
+  )
+
+# if not already defined
+pal_common <- c(
+  "King Eider" = unname(palette["KIEI"]),
+  "Long-tailed Duck" = unname(palette["LTDU"]),
+  "Spectacled Eider" = unname(palette["SPEI"]),
+  "Steller's Eider" = unname(palette["STEI"])
+)
+
+# publication-quality figure
+Fig5 <- ggplot() +
+  geom_ribbon(
+    data = pred_plot,
+    aes(x = DOY, ymin = lo, ymax = hi, fill = Species),
+    alpha = 0.25,
+    linewidth = 0
+  ) +
+  geom_rug(
+    data = raw_plot,
+    aes(x = DOY, color = Species),
+    sides = "b",
+    alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+  geom_line(
+    data = pred_plot,
+    aes(x = DOY, y = fit, color = Species),
+    linewidth = 1.4
+  ) +
+  facet_wrap(~ Species, ncol = 2) +
+  scale_color_manual(values = pal_common, guide = "none") +
+  scale_fill_manual(values = pal_common, guide = "none") +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    limits = c(0.60, 1.00),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  labs(
+    x = "Day of year (DOY)",
+    y = "Predicted daily incubation constancy"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_line(linewidth = 0.4, color = "grey80"),
+    panel.spacing      = unit(0.9, "lines"),
+    strip.text         = element_text(face = "bold")
+  )
+
+Fig5
+
+ggsave(
+  "Fig5.png",
+  plot = Fig5,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+```
+
+This plots the DOY x Species interaction only, with stage, temperature, and wind held at constant. Because my top model is on the logit scale, I back-transformed with plogis().
+
+```{r}
+### Plotting stage
+stage_seq <- seq(
+  min(constancy_camera$day_since_init, na.rm = TRUE),
+  max(constancy_camera$day_since_init, na.rm = TRUE),
+  length.out = 200
+)
+
+pred_stage <- expand.grid(
+  day_since_init = stage_seq,
+  Species = levels(constancy_camera$Species)
+) %>%
+  as_tibble() %>%
+  mutate(
+    z_stage = (day_since_init - mean(constancy_camera$day_since_init, na.rm = TRUE)) /
+              sd(constancy_camera$day_since_init, na.rm = TRUE),
+
+    # hold seasonal and weather variables constant
+    z_DOY  = 0,
+    z_TMAX = 0,
+    z_AWND = 0
+  )
+
+X <- model.matrix(
+  ~ z_DOY * Species + z_stage + z_TMAX + z_AWND,
+  data = pred_stage
+)
+
+b <- fixef(m_best)
+V <- vcov(m_best)
+
+X <- X[, names(b), drop = FALSE]
+
+fit_link <- as.vector(X %*% b)
+se_link  <- sqrt(pmax(0, diag(X %*% V %*% t(X))))
+
+pred_stage <- pred_stage %>%
+  mutate(
+    fit_link = fit_link,
+    lo_link  = fit_link - 1.96 * se_link,
+    hi_link  = fit_link + 1.96 * se_link,
+    fit = plogis(fit_link),
+    lo  = plogis(lo_link),
+    hi  = plogis(hi_link)
+  )
+
+pred_stage <- pred_stage %>%
+  mutate(
+    Species = recode_factor(
+      Species,
+      KIEI = "King Eider",
+      LTDU = "Long-tailed Duck",
+      SPEI = "Spectacled Eider",
+      STEI = "Steller's Eider"
+    )
+  )
+
+Fig_stage <- ggplot(pred_stage,
+  aes(x = day_since_init, y = fit, color = Species, fill = Species)) +
+
+  geom_ribbon(aes(ymin = lo, ymax = hi),
+              alpha = 0.25,
+              linewidth = 0) +
+
+  geom_line(linewidth = 1.4) +
+
+  facet_wrap(~ Species, ncol = 2) +
+
+  scale_color_manual(values = pal_common, guide = "none") +
+  scale_fill_manual(values = pal_common, guide = "none") +
+
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0.60, 1.00)
+  ) +
+
+  labs(
+    x = "Days since incubation start",
+    y = "Predicted incubation constancy"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+Fig_stage
+```
