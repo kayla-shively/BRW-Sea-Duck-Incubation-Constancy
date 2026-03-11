@@ -1,4 +1,21 @@
-.Rproj.user
+# Data files — copy locally after cloning; do NOT commit to git
+data/
+
+# Pipeline outputs — regenerated on each run
+outputs/
+
+# R
 .Rhistory
 .RData
-.Ruserdata
+.Rproj.user/
+*.Rcheck/
+
+# Quarto render cache and output
+_freeze/
+.quarto/
+*_cache/
+*_files/
+
+# OS
+.DS_Store
+Thumbs.db
