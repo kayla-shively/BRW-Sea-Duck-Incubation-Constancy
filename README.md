@@ -5,8 +5,8 @@ QA/QC pipeline for Barrow sea duck incubation constancy data.
 Loads Microsoft Access + Excel sources, resolves temporal gaps/overlaps, derives nest fates, and writes a clean SQLite database.
 
 FIRST: Run brw_qaqc.qmd adapted from Chris's 00_run_cl.qmd file to commit data tables to memory for downstream analyses. Does not render due to knitr flub but that is not critical. 
-SECOND: Run CURRENT SUMMARIES AND ANALYSES for incubation constancy table and figure creation. 
-THIRD: Run barrow_inc_comp_daily_hazard_simple_complex_updated20260301
+SECOND: Run CURRENT SUMMARIES AND ANALYSES.qmd for incubation constancy table and figure creation. 
+THIRD: Run barrow_inc_comp_daily_hazard_simple_complex_updated20260301.qmd
 ---
 
 ## Repository structure
