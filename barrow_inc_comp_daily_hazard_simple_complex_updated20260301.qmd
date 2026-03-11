@@ -1,0 +1,760 @@
+---
+title: "Discrete-time hazard (2-stage): Stage 1 selects terms (no constancy); Stage 2 tests ALL mixes ± constancy + Null (year fixed; nest random). Plus publication-quality figure + 26-day projection."
+author: "Latty, Christopher CL"
+format:
+  html:
+    toc: true
+    code-fold: show
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Why **glmmTMB** for this analysis
+
+- **Model form fits the biology and sampling.** We model **daily failure events** (0/1) with a **complementary log–log (cloglog) link**, the standard link for **discrete-time hazard** approximating continuous-time survival. This directly matches our windowed (24 h) event process.  
+- **Random effects ** The data are **multi-level** and **unbalanced** (many windows per nest; multiple years). We require **random intercepts** for **nest** and **year** to absorb heterogeneity and repeated measures; **glmmTMB** handles these structures cleanly.  
+- **Robustness + speed on larger GLMMs.** `glmmTMB` leverages **Template Model Builder (TMB)** for efficient likelihood evaluation and flexible optimizers (e.g., `nlminb` fallback), yielding **stable convergence** on **large**/sparse designs typical of our BRW windows.  
+- **Practical alternative trade‑offs.** `lme4::glmer` is an alternative but less flexible for dispersion/ZI; **Bayesian** (`brms/Stan`) is powerful but heavier to run/tune for routine QA/production. For our **binary hazard, nested random effects, and AICc‑based model selection**, **glmmTMB** is a good fit.
+
+
+```{r}
+# =============================================================================
+# 0) Setup — minimal packages, reproducibility, and helper utilities
+# =============================================================================
+#| label: setup
+
+# Install any missing packages, then load them.
+pkgs <- c(
+  "dplyr","tidyr","tibble","purrr","stringr",
+  "lubridate","glmmTMB","broom.mixed",
+  "ggplot2","scales","MuMIn","performance"
+)
+missing <- setdiff(pkgs, rownames(installed.packages()))
+if (length(missing)) install.packages(missing, dependencies = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Fix RNG seed for reproducibility (model selection, plotting).
+set.seed(1)
+
+# ---- Tunable analysis constants ----
+AK_TZ                   <- "America/Anchorage" # reference tz for upstream data (informational)
+MIN_HOURS_FOR_CONSTANCY <- 20                  # minimum measured (inc + noninc) hours per 24h window to accept constancy
+MIN_DURATION_DAYS       <- 1                   # minimum camera-days from first activity to fate for model inclusion
+CI_LEVEL_PLOT           <- 0.85                # CI level for population curve ribbon
+PROJECTION_DAYS         <- 26                  # days for survival projection figure
+CONSTANCY_SCENARIOS     <- c(0.70, 0.80, 0.90, 0.95, 0.98, 0.99) # fixed scenario values for projection
+
+# ---- Small helpers: readable building blocks for the pipeline ----
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# Clamp probabilities to (0,1) open interval to avoid infinities in links.
+safe_clamp01 <- function(x) pmin(pmax(x, 1e-6), 1 - 1e-6)
+
+# Z-score scale, safely handling zero variance.
+safe_scale <- function(x) {
+  m <- mean(x, na.rm = TRUE); s <- sd(x, na.rm = TRUE)
+  if (!is.finite(s) || s == 0) x*0 else (x - m)/s
+}
+
+# Parse common ISO-like strings to POSIXct (UTC). T and space separators are accepted.
+safe_parse_iso <- function(x) {
+  x_chr <- trimws(as.character(x))
+  x_chr <- ifelse(grepl("T", x_chr), gsub("T", " ", x_chr), x_chr)
+  suppressWarnings(lubridate::ymd_hms(x_chr, tz = "UTC"))
+}
+
+# Normalize behavior labels to three categories used for constancy calculation.
+norm_behavior <- function(b) {
+  b <- tolower(trimws(as.character(b)))
+  b <- gsub("[ -]", "_", b)
+  if (b %in% c("incubating","i_incubating","i","inc")) return("inc")
+  if (b %in% c("not_incubating","n_notincubating","nonincubating","noninc","n")) return("noninc")
+  if (b %in% c("unviewable","u_unviewable","u","missing","m_missing","m")) return("unviewable")
+  NA_character_
+}
+
+# Compute union length (seconds) across possibly overlapping intervals.
+# We convert to numeric seconds (UTC) and sweep to accumulate non-overlapping coverage.
+union_length_sec <- function(starts, ends) {
+  to_num <- function(x) if (inherits(x,"POSIXct")) as.numeric(x) else as.numeric(as.POSIXct(x, tz="UTC"))
+  s <- to_num(starts); e <- to_num(ends)
+  keep <- is.finite(s) & is.finite(e) & (e > s)
+  s <- s[keep]; e <- e[keep]
+  if (!length(s)) return(0)
+  ord <- order(s, e); s <- s[ord]; e <- e[ord]
+  tot <- 0; cs <- s[1]; ce <- e[1]
+  for (i in seq_along(s)[-1]) {
+    if (s[i] <= ce) { ce <- max(ce, e[i]) } else { tot <- tot + (ce - cs); cs <- s[i]; ce <- e[i] }
+  }
+  tot + (ce - cs)
+}
+
+# =============================================================================
+# 1) Upstream objects + nests master resolution
+#    Expect these in memory from the QA/QC loader: hen_act_abutted, fate_rows, nests_db, captures_events.
+# =============================================================================
+required_objs <- c("hen_act_abutted","fate_rows","nests_db","captures_events")
+has_obj <- vapply(required_objs, exists, logical(1))
+if (!all(has_obj)) {
+  stop("Missing in-memory objects: ", paste(required_objs[!has_obj], collapse = ", "),
+       "\nRun your QA/QC loader first to populate these objects.")
+}
+
+# Use nests_master_clean if available; fall back to nests_meta/min (select only what's needed).
+nests_master <- if (exists("nests_master_clean")) {
+  nests_master_clean
+} else if (exists("nests_meta")) {
+  dplyr::select(nests_meta, nest_id, init_median)
+} else if (exists("nests_meta_min")) {
+  dplyr::select(nests_meta_min, nest_id, init_median)
+} else {
+  stop("Missing 'nests_master_clean' (or fallback 'nests_meta' / 'nests_meta_min').")
+}
+
+# =============================================================================
+# 2) Build working 'raw' (UTC) from hen_act_abutted
+#    Goal: activity intervals (begin/end) in UTC for windowing and constancy.
+# =============================================================================
+needed_hen_cols <- c("nest_id","behavior","datetime_begin_corrected","datetime_end_corrected")
+if (!all(needed_hen_cols %in% names(hen_act_abutted))) {
+  stop("hen_act_abutted is missing columns: ",
+       paste(setdiff(needed_hen_cols, names(hen_act_abutted)), collapse = ", "))
+}
+
+raw <- hen_act_abutted %>%
+  transmute(
+    nest_id,
+    behavior,
+    # Convert corrected local times to UTC to standardize across windows.
+    datetime_begin = lubridate::with_tz(datetime_begin_corrected, "UTC"),
+    datetime_end   = lubridate::with_tz(datetime_end_corrected,   "UTC")
+  ) %>%
+  # Keep valid, forward intervals only.
+  filter(!is.na(datetime_begin), !is.na(datetime_end), datetime_end >= datetime_begin) %>%
+  as_tibble()
+
+# =============================================================================
+# 3) Fate table (UTC) — one fate per nest
+#    Goal: per-nest fate label and time for window construction and outcomes.
+# =============================================================================
+needed_fate_cols <- c("nest_id","fate","fate_datetime")
+if (!all(needed_fate_cols %in% names(fate_rows))) {
+  stop("fate_rows is missing columns: ",
+       paste(setdiff(needed_fate_cols, names(fate_rows)), collapse = ", "))
+}
+nest_fate <- fate_rows %>%
+  mutate(fate_datetime = lubridate::with_tz(fate_datetime, "UTC")) %>%
+  distinct(nest_id, .keep_all = TRUE)
+
+# =============================================================================
+# 4) Consolidation
+#    We keep 'raw' as-is; constancy computation will clip intervals per window.
+# =============================================================================
+stopifnot(all(c("nest_id","behavior","datetime_begin","datetime_end") %in% names(raw)))
+consolidated <- raw
+
+# =============================================================================
+# 5) Pre-fate timeline + basic quality filters
+#    Goal: restrict activity to strictly pre-fate periods; ensure species/init present.
+# =============================================================================
+
+# Attach fate to each activity; keep intervals strictly before fate time.
+pre_fate <- consolidated %>%
+  dplyr::left_join(nest_fate, by = "nest_id") %>%
+  dplyr::filter(!is.na(fate_datetime), datetime_begin < fate_datetime)
+
+# Nest-level metadata: species from Access; init_median from master.
+species_by_nest <- nests_db %>%
+  select(nest_id, species) %>%
+  filter(!is.na(nest_id) & nzchar(nest_id)) %>%
+  group_by(nest_id) %>%
+  summarise(species = dplyr::first(na.omit(species)), .groups = "drop")
+
+init_by_nest <- nests_master %>%
+  select(nest_id, init_median) %>%
+  mutate(init_median = suppressWarnings(as.numeric(init_median)))
+
+# Combine for modeling covariates; derive year from fate time.
+nest_meta <- species_by_nest %>%
+  left_join(nest_fate, by = "nest_id") %>%
+  left_join(init_by_nest, by = "nest_id") %>%
+  mutate(year = suppressWarnings(as.integer(lubridate::year(fate_datetime))))
+
+# Exclude nests with missing species/fate, or explicit "not viewable" fate text.
+quality_flags <- nest_meta %>%
+  transmute(
+    nest_id,
+    species_missing   = is.na(species),
+    fate_comb_missing = is.na(fate),
+    not_viewable_fate = stringr::str_detect(tolower(fate %||% ""), "nest_not_viewable|nest_is_not_viewable")
+  )
+pre_exclude_ids <- quality_flags %>%
+  filter(species_missing | fate_comb_missing | not_viewable_fate) %>%
+  pull(nest_id)
+pre_fate <- pre_fate %>% filter(!(nest_id %in% pre_exclude_ids))
+
+# Duration threshold: require at least MIN_DURATION_DAYS from first activity to fate.
+dur_by_nest <- pre_fate %>%
+  group_by(nest_id) %>%
+  summarise(
+    start_time    = suppressWarnings(min(datetime_begin, na.rm = TRUE)),
+    duration_days = as.numeric(difftime(suppressWarnings(max(fate_datetime, na.rm = TRUE)), start_time, units = "days")),
+    .groups = "drop"
+  )
+valid_nests <- dur_by_nest %>% filter(duration_days >= MIN_DURATION_DAYS) %>% pull(nest_id)
+pre_fate    <- pre_fate %>% filter(nest_id %in% valid_nests)
+
+cat("# nests (post filters):", length(unique(pre_fate$nest_id)), "\n")
+
+# =============================================================================
+# 5a) Capture events (UTC) — parse and prepare for window tagging
+#    Goal: quick lookup of capture events within last 24h of a window end.
+# =============================================================================
+needed_capture_cols <- c("nest_id","capture_dt_iso")
+if (!all(needed_capture_cols %in% names(captures_events))) {
+  stop("captures_events is missing columns: ",
+       paste(setdiff(needed_capture_cols, names(captures_events)), collapse = ", "))
+}
+cap_tbl <- captures_events %>%
+  transmute(nest_id, capture_dt = safe_parse_iso(capture_dt_iso)) %>%
+  filter(!is.na(nest_id), !is.na(capture_dt)) %>%
+  as_tibble()
+cap_by_nest <- split(cap_tbl$capture_dt, cap_tbl$nest_id) # per-nest list of capture times
+
+# =============================================================================
+# 6) Daily windows stepping back from fate + constancy per window
+#    Goal: create contiguous 24h windows ending at fate; compute constancy per window.
+# =============================================================================
+
+# Create 24h windows ending at fate_time. Returns tibble with start/end and day index (1 = day ending at fate).
+make_windows <- function(nid, nest_df, fate_time) {
+  earliest <- suppressWarnings(min(nest_df$datetime_begin, na.rm = TRUE))
+  if (is.na(fate_time) || is.na(earliest)) return(NULL)
+  span_hours <- as.numeric(difftime(fate_time, earliest, units = "hours"))
+  n <- floor(span_hours / 24)
+  if (!is.finite(n) || n <= 0) return(NULL)
+
+  ends   <- fate_time - lubridate::hours(0:(n-1) * 24)
+  starts <- ends - lubridate::hours(24)
+
+  tibble(
+    win_start      = starts,
+    win_end        = ends,
+    day_index_back = seq_len(n)
+  )
+}
+
+# Compute constancy in [ws, we]: fraction of measured time labeled 'inc'.
+# Requires >= MIN_HOURS_FOR_CONSTANCY hours of measured time (inc + noninc) in the window; else returns NA.
+calc_constancy_in_window <- function(nest_df, ws, we) {
+  dtw <- nest_df %>%
+    dplyr::filter(datetime_begin < we, datetime_end > ws) %>%
+    dplyr::mutate(
+      clipped_start = pmax(datetime_begin, ws),
+      clipped_end   = pmin(datetime_end,   we),
+      category      = vapply(behavior, norm_behavior, FUN.VALUE = character(1))
+    ) %>%
+    dplyr::filter(clipped_end > clipped_start, category %in% c("inc","noninc"))
+
+  inc    <- dtw %>% dplyr::filter(category == "inc")
+  noninc <- dtw %>% dplyr::filter(category == "noninc")
+
+  inc_sec      <- if (nrow(inc))    union_length_sec(inc$clipped_start,    inc$clipped_end)    else 0
+  noninc_sec   <- if (nrow(noninc)) union_length_sec(noninc$clipped_start, noninc$clipped_end) else 0
+  measured_sec <- inc_sec + noninc_sec
+  measured_hrs <- measured_sec / 3600
+
+  if (!is.finite(measured_hrs) || measured_hrs < MIN_HOURS_FOR_CONSTANCY || measured_sec <= 0) return(NA_real_)
+  inc_sec / measured_sec
+}
+
+# Flag a capture within the last 24h ending at 'we'. Returns 0/1 integer.
+had_capture_last24 <- function(nid, we) {
+  caps <- cap_by_nest[[as.character(nid)]]
+  if (is.null(caps) || !length(caps)) return(0L)
+  as.integer(any(caps > (we - lubridate::hours(24)) & caps <= we))
+}
+
+# Build a per-nest daily window table. group_modify supplies nest_id to the result automatically.
+pre_fate_tbl <- tibble::as_tibble(pre_fate)
+
+daily <- pre_fate_tbl %>%
+  dplyr::group_by(nest_id) %>%
+  dplyr::group_modify(function(.x, .key) {
+    nid <- .key$nest_id[[1]]
+    ft  <- dplyr::first(na.omit(.x$fate_datetime))
+
+    w <- make_windows(nid, .x, ft)
+    if (is.null(w) || nrow(w) == 0) return(tibble::tibble())
+
+    purrr::pmap_dfr(list(w$win_start, w$win_end, w$day_index_back),
+      function(ws, we, k) {
+        tibble::tibble(
+          win_start      = ws,
+          win_end        = we,
+          day_index_back = k,
+          constancy      = calc_constancy_in_window(.x, ws, we),  # fraction incubating
+          cap_last24     = had_capture_last24(nid, we)            # capture indicator
+        )
+      }
+    )
+  }) %>%
+  dplyr::ungroup()
+
+# =============================================================================
+# 7) Modeling dataset 'daily_model' — binary event per day
+#    Goal: discrete-time hazard with event_today = 1 on failure window; 0 otherwise.
+# =============================================================================
+dm_pre <- daily %>%
+  dplyr::left_join(nest_meta, by = "nest_id") %>%
+  dplyr::mutate(
+    fate_clean = tolower(trimws(fate)),
+    # Event indicator: only 1 on failure day (day_index_back == 1 for 'failed'); otherwise 0.
+    event_today = as.integer(fate_clean == "failed" & day_index_back == 1L)
+  )
+
+# Simple audits for missingness in key covariates (no censoring here).
+cat("Rows with NA constancy:   ", sum(is.na(dm_pre$constancy)),   "\n")
+cat("Rows with NA init_median: ", sum(is.na(dm_pre$init_median)), "\n")
+cat("Rows with NA cap_last24:  ", sum(is.na(dm_pre$cap_last24)),  "\n")
+
+daily_model <- dm_pre %>%
+  dplyr::mutate(
+    constancy_clamped = safe_clamp01(constancy), # safe range for link
+    cap_last24        = as.integer(cap_last24),  # 0/1 as integer factor-like
+    nest_id           = factor(nest_id),
+    species           = factor(species),
+    year              = factor(year)
+  ) %>%
+  # Camera-days since deployment: max day_index_back per nest - current day_index_back
+  dplyr::group_by(nest_id) %>%
+  dplyr::mutate(cam_days_since_deploy = max(day_index_back, na.rm = TRUE) - day_index_back) %>%
+  dplyr::ungroup() %>%
+  # Within-species scaling to reduce collinearity and aid convergence.
+  dplyr::group_by(species) %>%
+  dplyr::mutate(
+    init_median_cs = safe_scale(init_median),
+    cam_days_cs    = safe_scale(cam_days_since_deploy)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(!is.na(nest_id), !is.na(species)) %>%
+  droplevels()
+
+cat("# windows in daily_model: ", nrow(daily_model), "\n")
+
+stopifnot(all(c(
+  "event_today","constancy_clamped","cap_last24","species","year","init_median"
+) %in% names(daily_model)))
+
+# =============================================================================
+# 8) Stage 1 — term selection WITHOUT constancy (cloglog link; random: nest, year)
+#     Goal: pick fixed terms to carry forward; evaluate with AIC, AICc (ΔAICc + weights).
+# =============================================================================
+
+# ---- Helpers: parse RHS terms and build stage-specific complete-case data ----
+# Parse a RHS string ("species + init_median_cs") into individual terms.
+terms_in_rhs <- function(rhs) {
+  rhs <- gsub("\\s+", " ", trimws(rhs))
+  parts <- unlist(strsplit(rhs, "\\+"))
+  parts <- trimws(parts)
+  parts[parts != "" & parts != "1"]
+}
+
+# Union of terms across multiple RHS strings (unique, sorted).
+union_terms <- function(rhs_list) {
+  unq <- unique(unlist(lapply(rhs_list, terms_in_rhs)))
+  sort(unq)
+}
+
+# Build a complete-case dataset for a stage: drop rows with NA in required predictors; print NA audit.
+build_stage_data <- function(base_df, required_terms, stage_name = "Stage") {
+  if (length(required_terms) == 0) {
+    stage_df <- base_df %>% dplyr::filter(!is.na(event_today))
+  } else {
+    na_audit <- base_df %>%
+      dplyr::summarise(dplyr::across(dplyr::all_of(required_terms), ~ sum(is.na(.), na.rm = TRUE)))
+    cat(sprintf("\n%s: NA counts among required predictors\n", stage_name)); print(na_audit)
+
+    stage_df <- base_df %>%
+      dplyr::filter(!is.na(event_today)) %>%
+      dplyr::filter(stats::complete.cases(dplyr::pick(dplyr::all_of(required_terms))))
+  }
+  cat(sprintf("%s: rows retained after censoring: %d (of %d)\n",
+              stage_name, nrow(stage_df), nrow(base_df)))
+  if (nrow(stage_df) == 0) stop(stage_name, ": no rows remain after censoring—check missingness.")
+  stage_df
+}
+
+# Summarize row usage across fitted models in a stage (helps spot convergence/NA issues).
+summarize_run_counts <- function(fits, stage_df, stage_name) {
+  tibble::tibble(
+    Stage               = stage_name,
+    Model               = names(fits),
+    n_stage_available   = nrow(stage_df),
+    n_used              = purrr::map_int(fits, ~ as.integer(nobs(.x))),
+    dropped_after_stage = n_stage_available - n_used
+  )
+}
+
+# Safe nobs (fallback to model.frame when nobs not available).
+safe_nobs <- function(fit) {
+  n <- suppressWarnings(tryCatch(as.integer(nobs(fit)), error = function(e) NA_integer_))
+  if (is.na(n) || !is.finite(n)) {
+    mf <- suppressWarnings(tryCatch(stats::model.frame(fit), error = function(e) NULL))
+    if (is.null(mf)) NA_integer_ else nrow(mf)
+  } else n
+}
+
+# ---- Core fit metrics (NO R²) ----
+# We keep AIC, AICc, logLik, number of parameters (npar), rows used, and weights.
+model_metrics <- function(m, label, data, stage) {
+  ll   <- suppressWarnings(tryCatch(as.numeric(logLik(m)), error = function(e) NA_real_))
+  k    <- suppressWarnings(tryCatch(attr(logLik(m), "df"),   error = function(e) NA_real_))
+  n    <- suppressWarnings(tryCatch(as.integer(nobs(m)),     error = function(e) nrow(data)))
+  aic  <- suppressWarnings(tryCatch(AIC(m),                  error = function(e) NA_real_))
+  aicc <- if (is.finite(aic) && is.finite(k) && is.finite(n) && (n - k - 1) > 0) aic + (2*k*(k+1))/(n - k - 1) else NA_real_
+  tibble::tibble(
+    Stage  = stage,
+    Model  = label,
+    n_used = n,
+    npar   = k,     # <— number of parameters
+    logLik = ll,
+    AIC    = aic,   # <— AIC
+    AICc   = aicc,
+    weight = NA_real_
+  )
+}
+
+# Candidate fixed-effect structures for Stage 1 (without constancy).
+rhs_terms <- list(
+  "Null"                      = "1",
+  "Species"                   = "species",
+  "Init"                      = "init_median_cs",
+  "Cam-days"                  = "cam_days_cs",
+  "Species + Init"            = "species + init_median_cs",
+  "Species + Cam-days"        = "species + cam_days_cs",
+  "Init + Cam-days"           = "init_median_cs + cam_days_cs",
+  "Species + Init + Cam-days" = "species + init_median_cs + cam_days_cs"
+)
+
+# Stage‑1 dataset: complete cases for union of S1 predictors.
+s1_required_terms <- union_terms(rhs_terms)   # c("cam_days_cs","init_median_cs","species")
+stage1_data <- build_stage_data(daily_model, s1_required_terms, stage_name = "Stage 1")
+
+# Quick row summary entering Stage 1.
+s1_summary <- tibble::tibble(
+  Stage         = "Stage 1",
+  total_rows    = nrow(daily_model),
+  retained_rows = nrow(stage1_data),
+  dropped_rows  = total_rows - retained_rows,
+  retained_pct  = round(100 * retained_rows / pmax(total_rows, 1), 1)
+)
+print(s1_summary)
+
+# Mixed model formula (cloglog; random intercepts: nest_id, year).
+make_mixed_formula <- function(rhs) {
+  as.formula(paste("event_today ~", rhs, "+ (1|nest_id) + (1|year)"))
+}
+
+# Fit convenience wrapper: try default optimizer first, then nlminb.
+fit_one <- function(formula_mixed, data, label) {
+  fam <- binomial(link = "cloglog")
+  fm  <- try(glmmTMB::glmmTMB(formula_mixed, family = fam, data = as.data.frame(data)), silent = TRUE)
+  if (!inherits(fm, "try-error")) { attr(fm,"label") <- label; return(fm) }
+  fm2 <- glmmTMB::glmmTMB(formula_mixed, family = fam, data = as.data.frame(data),
+                          control = glmmTMB::glmmTMBControl(optimizer = "nlminb"))
+  attr(fm2,"label") <- label
+  fm2
+}
+
+# Fit all Stage‑1 models and compute metrics (AIC/AICc; no R²).
+stage1_fits <- purrr::imap(rhs_terms, ~ fit_one(make_mixed_formula(.x), data = stage1_data, label = paste("S1:", .y)))
+names(stage1_fits) <- paste("S1:", names(rhs_terms))
+
+stage1_tab <- purrr::imap_dfr(
+  stage1_fits,
+  ~ model_metrics(.x, .y, data = stage1_data, stage = "Stage1")
+) %>%
+  dplyr::arrange(AICc) %>%
+  dplyr::mutate(
+    DeltaAICc = AICc - min(AICc, na.rm = TRUE),
+    weight    = exp(-0.5 * DeltaAICc) / sum(exp(-0.5 * DeltaAICc), na.rm = TRUE)
+  )
+
+# Row-usage table (n used per fit) merged with key metrics.
+stage1_run_counts <- tibble::tibble(
+  Stage               = "Stage1",
+  Model               = names(stage1_fits),
+  n_stage_available   = nrow(stage1_data),
+  n_used              = purrr::map_int(stage1_fits, safe_nobs),
+  dropped_after_stage = n_stage_available - n_used
+)
+
+stage1_tab_runs <- stage1_tab %>%
+  dplyr::left_join(stage1_run_counts, by = c("Stage","Model")) %>%
+  dplyr::select(dplyr::any_of(c(
+    "Model",
+    "n_stage_available","n_used","dropped_after_stage",
+    "npar",             # <— include number of parameters
+    "AIC","AICc",       # <— include AIC and AICc
+    "DeltaAICc","weight"
+  )))
+
+cat("\n--- Stage 1 row usage & metrics (npar, AIC, AICc, ΔAICc, weight) ---\n")
+print(stage1_tab_runs, n = Inf)
+
+# Select fixed terms for Stage 2 from the best AICc model.
+best1_row <- stage1_tab %>%
+  dplyr::filter(is.finite(AICc)) %>%
+  dplyr::arrange(AICc) %>%
+  dplyr::slice(1)
+if (nrow(best1_row) == 0) stop("Stage 1: no finite AICc — cannot select fixed terms.")
+
+best1_label    <- best1_row$Model[[1]]
+best1_rhs_name <- sub("^S1:\\s*", "", best1_label)
+best1_rhs      <- rhs_terms[[best1_rhs_name]] %||% "1"
+fixed_terms_stage1 <- terms_in_rhs(best1_rhs) # could be character(0) if Null won
+
+cat("\nStage 1 selection → terms for Stage 2: {",
+    if (length(fixed_terms_stage1)) paste(fixed_terms_stage1, collapse = ", ") else "∅ (Null)",
+    "}\n", sep = "")
+
+# =============================================================================
+# 9) Stage 2 — ALL subsets of Stage‑1 fixed terms ± constancy ± cap_last24 (+ Null)
+#     Random intercepts kept (nest_id, year). Rank by AICc; report weights (and show AIC/npar).
+# =============================================================================
+
+# Stage‑2 dataset: complete cases across (Stage‑1 terms ∪ constancy ∪ cap_last24).
+s2_required_terms <- sort(unique(c(fixed_terms_stage1, "constancy_clamped", "cap_last24")))
+stage2_data <- build_stage_data(daily_model, s2_required_terms, stage_name = "Stage 2")
+
+s2_summary <- tibble::tibble(
+  Stage         = "Stage 2",
+  total_rows    = nrow(daily_model),
+  retained_rows = nrow(stage2_data),
+  dropped_rows  = total_rows - retained_rows,
+  retained_pct  = round(100 * retained_rows / pmax(total_rows, 1), 1)
+)
+print(s2_summary)
+
+# Generate all subsets of Stage‑1 fixed terms, crossed with extras {none, constancy, cap_last24, both}.
+power_set <- function(x) {
+  if (length(x) == 0) return(list(character(0)))
+  idx <- unlist(lapply(seq_along(x), function(k) combn(seq_along(x), k, simplify = FALSE)), recursive = FALSE)
+  c(list(character(0)), lapply(idx, function(i) x[i]))
+}
+stage2_subsets <- power_set(fixed_terms_stage1)
+
+stage2_labels <- character(0); stage2_forms <- list()
+for (S in stage2_subsets) {
+  extras_list <- list(
+    character(0),
+    "constancy_clamped",
+    "cap_last24",
+    c("constancy_clamped","cap_last24")
+  )
+  if (length(S) == 0) {
+    stage2_labels <- c(stage2_labels, "S2: Null")
+    stage2_forms  <- c(stage2_forms,  list(as.formula("event_today ~ 1 + (1|nest_id) + (1|year)")))
+  }
+  for (E in extras_list) {
+    terms_vec <- c(E, S)
+    if (length(terms_vec) == 0) next
+    rhs <- paste(terms_vec, collapse = " + ")
+    stage2_labels <- c(stage2_labels, paste("S2:", rhs))
+    stage2_forms  <- c(stage2_forms,  list(as.formula(paste("event_today ~", rhs, "+ (1|nest_id) + (1|year)"))))
+  }
+}
+
+# Fit Stage‑2 candidates; fallback optimizer if needed.
+fit_one_stage2 <- function(formula_mixed, data, label) {
+  fam <- binomial(link = "cloglog")
+  fm  <- try(glmmTMB::glmmTMB(formula_mixed, family = fam, data = as.data.frame(data)), silent = TRUE)
+  if (!inherits(fm, "try-error")) { attr(fm,"label") <- label; return(fm) }
+  fm2 <- glmmTMB::glmmTMB(formula_mixed, family = fam, data = as.data.frame(data),
+                          control = glmmTMB::glmmTMBControl(optimizer = "nlminb"))
+  attr(fm2,"label") <- label
+  fm2
+}
+
+stage2_fits <- setNames(
+  Map(function(lbl, fml) fit_one_stage2(fml, stage2_data, label = lbl), stage2_labels, stage2_forms),
+  stage2_labels
+)
+
+stage2_tab <- purrr::imap_dfr(
+  stage2_fits,
+  ~ model_metrics(.x, .y, data = stage2_data, stage = "Stage2")
+) %>%
+  dplyr::arrange(AICc) %>%
+  dplyr::mutate(
+    DeltaAICc = AICc - min(AICc, na.rm = TRUE),
+    weight    = exp(-0.5 * DeltaAICc) / sum(exp(-0.5 * DeltaAICc), na.rm = TRUE)
+  )
+
+# Row-usage table merged with key metrics.
+stage2_run_counts <- tibble::tibble(
+  Stage               = "Stage2",
+  Model               = names(stage2_fits),
+  n_stage_available   = nrow(stage2_data),
+  n_used              = purrr::map_int(stage2_fits, safe_nobs),
+  dropped_after_stage = n_stage_available - n_used
+)
+
+stage2_tab_runs <- stage2_tab %>%
+  dplyr::left_join(stage2_run_counts, by = c("Stage","Model")) %>%
+  dplyr::select(dplyr::any_of(c(
+    "Model",
+    "n_stage_available","n_used","dropped_after_stage",
+    "npar",             # <— include number of parameters
+    "AIC","AICc",       # <— include AIC and AICc
+    "DeltaAICc","weight"
+  )))
+
+cat("\n--- Stage 2 row usage & metrics (npar, AIC, AICc, ΔAICc, weight) ---\n")
+print(stage2_tab_runs, n = Inf)
+
+# Identify top Stage‑2 model by smallest AICc (fallback to AIC if AICc NA across fits).
+best2_row <- stage2_tab %>%
+  dplyr::filter(is.finite(AICc)) %>%
+  dplyr::arrange(AICc) %>%
+  dplyr::slice(1)
+
+if (nrow(best2_row) == 0 || !is.finite(best2_row$AICc)) {
+  idx <- which.min(purrr::map_dbl(stage2_fits, ~ suppressWarnings(AIC(.x))))
+  best2_label <- names(stage2_fits)[idx]
+  best2_fit   <- stage2_fits[[idx]]
+} else {
+  best2_label <- best2_row$Model[[1]]
+  best2_fit   <- stage2_fits[[best2_label]]
+}
+cat("\nTop Stage 2 model: ", best2_label, "\n", sep = "")
+stopifnot(!is.null(best2_fit))
+
+# =============================================================================
+# 10) Figure 1 — Daily nest survival vs incubation constancy (population-level; 85% CI)
+#     If top S2 lacks constancy, plot with the best S2 model that includes constancy (for visualization).
+# =============================================================================
+
+parse_terms_from_label <- function(lbl) {
+  rhs <- sub("^S2:\\s*", "", lbl); rhs <- trimws(rhs)
+  if (rhs %in% c("Null","1")) return(character(0))
+  parts <- unlist(strsplit(rhs, "\\+"))
+  trimws(parts[parts != ""])
+}
+
+fixed_in_best2 <- parse_terms_from_label(best2_label)
+plot_fit   <- best2_fit; plot_label <- best2_label
+
+if (!("constancy_clamped" %in% fixed_in_best2)) {
+  const_rows <- stage2_tab %>% filter(stringr::str_detect(Model, "constancy_clamped")) %>% arrange(AICc)
+  if (nrow(const_rows) > 0) {
+    plot_label <- const_rows$Model[1]; plot_fit <- stage2_fits[[plot_label]]
+    message("Top S2 model lacked constancy; plotting with best S2 model including constancy: ", plot_label)
+  } else stop("No Stage 2 models include constancy_clamped; cannot draw constancy curve.")
+}
+
+plot_terms  <- unique(parse_terms_from_label(plot_label))
+rhs_formula <- as.formula(paste("~", paste(plot_terms, collapse = " + ")))
+
+# Reference levels and medians for covariates held fixed in the population curve.
+species_ref        <- names(sort(table(daily_model$species), decreasing = TRUE))[1]
+year_ref           <- names(sort(table(daily_model$year),    decreasing = TRUE))[1]
+const_bounds       <- range(daily_model$constancy_clamped,   na.rm = TRUE)
+init_median_cs_med <- median(daily_model$init_median_cs,     na.rm = TRUE)
+cam_days_cs_med    <- median(daily_model$cam_days_cs,        na.rm = TRUE)
+
+nd1 <- tibble(constancy_clamped = seq(const_bounds[1], const_bounds[2], length.out = 200))
+if ("species"         %in% plot_terms) nd1$species         <- factor(species_ref, levels = levels(daily_model$species))
+if ("year"            %in% plot_terms) nd1$year            <- factor(year_ref,    levels = levels(daily_model$year))
+if ("init_median_cs"  %in% plot_terms) nd1$init_median_cs  <- init_median_cs_med
+if ("cam_days_cs"     %in% plot_terms) nd1$cam_days_cs     <- cam_days_cs_med
+if ("cap_last24"      %in% plot_terms) nd1$cap_last24      <- 0L  # hold at "no capture in last 24h" for population curve
+
+p_fail_hat <- as.numeric(predict(plot_fit, newdata = as.data.frame(nd1), type = "response", re.form = NA))
+s_hat      <- 1 - p_fail_hat
+
+# Fixed-effects CI on cloglog scale → transform back to probability
+ci_level <- CI_LEVEL_PLOT; z_alpha <- qnorm(0.5 + ci_level/2)
+mm   <- stats::model.matrix(rhs_formula, data = as.data.frame(nd1))
+beta <- fixef(plot_fit)$cond
+V    <- vcov(plot_fit)$cond
+if (!"(Intercept)" %in% colnames(mm)) mm <- cbind("(Intercept)" = 1, mm)
+beta <- beta[colnames(mm)]; beta[is.na(beta)] <- 0
+V    <- V[colnames(mm), colnames(mm), drop = FALSE]
+eta_hat <- as.vector(mm %*% beta)
+eta_se  <- sqrt(pmax(rowSums((mm %*% V) * mm), 0))
+
+inv_cloglog <- function(eta) 1 - exp(-exp(eta))
+p_lo <- inv_cloglog(eta_hat - z_alpha * eta_se)
+p_hi <- inv_cloglog(eta_hat + z_alpha * eta_se)
+s_lo <- 1 - p_hi; s_hi <- 1 - p_lo
+
+plot_df <- nd1 %>% mutate(s_hat = s_hat, s_lo = s_lo, s_hi = s_hi)
+
+gg_constancy_surv <- ggplot(plot_df, aes(x = constancy_clamped, y = s_hat)) +
+  geom_ribbon(aes(ymin = s_lo, ymax = s_hi), fill = "#74c476", alpha = 0.25, color = NA) +
+  geom_line(color = "#238b45", size = 1.1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  coord_cartesian(xlim = const_bounds) +
+  labs(
+    x = "Incubation constancy (daily proportion incubating)",
+    y = "Predicted daily nest-survival probability",
+    title    = "Daily nest survival vs incubation constancy",
+    subtitle = "Population-level predictions; covariates at medians; random effects excluded",
+    caption  = "Shaded band: 85% CI from fixed-effects uncertainty; cap_last24 held at 0 if present."
+  ) +
+  theme_bw(base_size = 12)
+print(gg_constancy_surv)
+
+# =============================================================================
+# 11) Figure 2 — 26-day projection under constancy scenarios (population-level)
+#     Goal: cumulative survival curves across fixed constancy values over 26 days.
+# =============================================================================
+
+make_profile_surv <- function(const_val, D = PROJECTION_DAYS) {
+  nd <- tibble(constancy_clamped = rep(const_val, D))
+  if ("init_median_cs" %in% plot_terms) nd$init_median_cs <- rep(init_median_cs_med, D)
+  if ("cam_days_cs"    %in% plot_terms) nd$cam_days_cs    <- rep(cam_days_cs_med, D)
+  if ("species"        %in% plot_terms) nd$species        <- factor(species_ref, levels = levels(daily_model$species))
+  if ("year"           %in% plot_terms) nd$year           <- factor(year_ref,    levels = levels(daily_model$year))
+  if ("cap_last24"     %in% plot_terms) nd$cap_last24     <- rep(0L, D)
+
+  p_fail_day <- as.numeric(predict(plot_fit, newdata = as.data.frame(nd), type = "response", re.form = NA))
+  s_day      <- 1 - p_fail_day
+  tibble(day = 0:(D-1), constancy_clamped = const_val, s_day = s_day)
+}
+
+proj_surv_df <- purrr::map_dfr(CONSTANCY_SCENARIOS, make_profile_surv) %>%
+  group_by(constancy_clamped) %>%
+  arrange(day, .by_group = TRUE) %>%
+  mutate(surv_day = cumprod(s_day)) %>%
+  ungroup()
+
+gg_26_surv <- ggplot(proj_surv_df, aes(x = day + 1, y = surv_day, color = factor(constancy_clamped))) +
+  geom_line(size = 1.1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_color_brewer(palette = "Dark2", name = "Constancy") +
+  labs(
+    x = "Incubation day (since camera deployment)",
+    y = "Cumulative nest-survival probability",
+    title = paste(PROJECTION_DAYS, "-day projection under constancy scenarios"),
+    subtitle = "Population-level; covariates fixed at dataset medians; cap_last24 held at 0 if present",
+    caption = "Constancy held constant within each scenario."
+  ) +
+  theme_bw(base_size = 12)
+print(gg_26_surv)
+
+proj_surv_summary <- proj_surv_df %>%
+  group_by(constancy_clamped) %>%
+  summarise(survival_day26 = surv_day[which.max(day)], .groups = "drop")
+print(proj_surv_summary)
+
+# =============================================================================
+# End
+
+
+```
