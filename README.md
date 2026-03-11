@@ -2,7 +2,7 @@
 
 QA/QC pipeline for Barrow sea duck incubation constancy data.  
 Loads Microsoft Access + Excel sources, resolves temporal gaps/overlaps, derives nest fates, and writes a clean SQLite database.
-
+Run brw_qaqc.qmd FIRST to commit data files to memory for downstream analyses. 
 ---
 
 ## Repository structure
